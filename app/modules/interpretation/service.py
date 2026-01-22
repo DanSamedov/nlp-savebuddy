@@ -81,8 +81,6 @@ class InterpretationService:
         return None, text, 0.0
 
     def _normalize_frequency(self, text: Optional[str]) -> Optional[str]:
-        if not text:
-            return None
         text = text.lower()
         
         # Check for explicit recurrence keywords

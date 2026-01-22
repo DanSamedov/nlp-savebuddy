@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL_NAME: str
     
     # Logic Thresholds
-    MATCH_THRESHOLD: float = 0.5
+    MATCH_THRESHOLD: float
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -31,17 +31,17 @@ class InterpretationService:
         now = datetime.now()
         return f"Today is {now.strftime('%Y-%m-%d')}. The user's prompt is:"
 
-    def _ask_qa(self, question: str, context: str) -> Optional[str]:
-        """Runs the QA pipeline and returns the answer string"""
+    def _ask_qa(self, question: str, context: str) -> Tuple[Optional[str], int, int]:
+        """Runs the QA pipeline and returns (answer, start_index, end_index)"""
         try:
             result = self.qa_pipeline(question=question, context=context)
             answer = result['answer'].strip()
             
 
-            return answer
+            return answer, result['start'], result['end']
         except Exception as e:
             logger.error(f"QA Error for question '{question}': {e}")
-            return None
+            return None, 0, 0
 
     def _match_entity(self, text: str, candidates: Dict[str, str]) -> Tuple[Optional[str], Optional[str], float]:
         """
@@ -54,7 +54,16 @@ class InterpretationService:
 
         candidate_ids = list(candidates.keys())
         candidate_names = list(candidates.values())
+
+        # 1. Exact/Substring Match (Case-insensitive)
+        text_lower = text.lower()
+        for idx, name in enumerate(candidate_names):
+            name_lower = name.lower()
+            # Check for exact match or strong substring match
+            if name_lower == text_lower or name_lower in text_lower or text_lower in name_lower:
+                return candidate_ids[idx], name, 1.0
         
+        # 2. Semantic Search
         query_emb = self.embedder.encode(text, convert_to_tensor=True)
         corpus_emb = self.embedder.encode(candidate_names, convert_to_tensor=True)
         
@@ -92,9 +101,6 @@ class InterpretationService:
         return "ONCE" # Default fallback
 
     def _normalize_currency(self, text: Optional[str]) -> str:
-        if not text:
-            return "NOT_SUPPORTED"
-        
         text_lower = text.lower().strip()
         
         if any(x in text_lower for x in ["eur", "euro", "€"]):
@@ -133,15 +139,14 @@ class InterpretationService:
     def interpret(self, context: InterpretationContext) -> InterpretationResult:
         time_context = self._get_current_context_string() 
         group_names = ", ".join(context.user_groups.values()) if context.user_groups else "None"
+        goal_names = ", ".join(context.user_goals.values()) if context.user_goals else "None"
         
         augmented_text = (
-            f"{time_context}\n"
-            f"User Prompt: {context.prompt}\n"
-            f"Known Groups: {group_names}.\n"
+            f"Analyze this request for saving details.\n"
+            f"User's Request: {context.prompt}\n"
+            f"Time context: {time_context}\n"
         ).lower()
-        
 
-        
         final_group_id = None
         final_group_name = None
         is_existing_group = False
@@ -165,25 +170,38 @@ class InterpretationService:
                     break
         
         if not found_group_direct_match:
-            target_text = self._ask_qa("What is the money for?", augmented_text)
+            intent_text, i_start, i_end = self._ask_qa("Does the user want to save for a group or for themselves? Answer only with 'group_saving' or 'personal_saving'.", augmented_text)
             
+            if intent_text == "group_saving":
+                intent = "group_saving"
+                target_text, t_start, t_end = self._ask_qa("What is the specific name of the    group being saved for, from the User's Request?", augmented_text)
+            
+            else:
+                intent = "personal_saving"
+                target_text, t_start, t_end = self._ask_qa("What is the specific name of the item or objective being saved for, from the User's Request?", augmented_text)
+
+            if target_text:
+                # Validation: Check if day of week
+                if target_text and any(d in target_text.lower() for d in DAYS):
+                     target_text = None
+
             if target_text:
                 # Check against Groups first
                 g_id, g_name, g_score = self._match_entity(target_text, context.user_groups)
                 # Check against Goals
                 gl_id, gl_name, gl_score = self._match_entity(target_text, context.user_goals)
                 
-                # Prioritize Group match if strong
-                if g_id and g_score > gl_score:
-                    intent = "group_saving"
-                    final_group_id = g_id
-                    final_group_name = g_name
-                    is_existing_group = True
-                elif gl_id:
-                     intent = "personal_saving"
-                     final_goal_id = gl_id
-                     final_goal_name = gl_name
-                     is_existing_goal = True
+                # Prioritize Goal match if strong
+                if gl_id and gl_score > g_score:
+                    intent = "personal_saving"
+                    final_goal_id = gl_id
+                    final_goal_name = gl_name
+                    is_existing_goal = True
+                elif g_id:
+                     intent = "group_saving"
+                     final_group_id = g_id
+                     final_group_name = g_name
+                     is_existing_group = True
                 else:
                     # New Entity. Check context for "group" keyword fallback
                     if "group" in context.prompt.lower():
@@ -201,7 +219,7 @@ class InterpretationService:
 
         logger.info(f"Determined Intent: {intent}")
 
-        amount_text = self._ask_qa("What is the monetary amount to save?", augmented_text)
+        amount_text, _, _ = self._ask_qa("What is the specific monetary value or numerical amount to be saved from the User's Request?", augmented_text)
         amount_val = None
         if amount_text:
             match = re.search(r"[\d,]+(\.\d+)?", amount_text)
@@ -211,20 +229,18 @@ class InterpretationService:
                 except:
                     pass
 
-        currency_text = self._ask_qa("What is the currency of the saving?", augmented_text)
-        if currency_text:
-             currency_text = re.sub(r"[\d.,\s]+", "", currency_text)
+        currency_text, _, _ = self._ask_qa("What is the currency associated with the amount from the User's Request?", augmented_text)
         currency = self._normalize_currency(currency_text)
 
-        frequency_text = self._ask_qa("How often should the deposit be made?", augmented_text)
+        frequency_text, _, _ = self._ask_qa("How often should the deposit be made(e.g. daily, weekly, monthly), based on the User's Request?", augmented_text)
         frequency = self._normalize_frequency(frequency_text)
         
-        day_text = self._ask_qa("On which day of the week?", augmented_text)
+        day_text, _, _ = self._ask_qa("Which specific day of the week (e.g. Monday, Tuesday) is mentioned in the User's Request?", augmented_text)
         day_of_week = self._validate_day(day_text)
         
-        start_date_text = self._ask_qa("When should the saving plan start?", augmented_text)
+        start_date_text, _, _ = self._ask_qa("What is the specific start date or starting time mentioned in the User's Request?", augmented_text)
         
-        duration_text = self._ask_qa("For how long should the saving last?", augmented_text)
+        duration_text, _, _ = self._ask_qa("What is the duration, end date, or stopping condition for the saving in the User's Request?", augmented_text)
         end_date = self._calculate_end_date(start_date_text, duration_text)
 
         data = InterpretationData(
